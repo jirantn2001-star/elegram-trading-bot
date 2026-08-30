@@ -61,8 +61,5 @@ def bot_loop():
             print("เกิดข้อผิดพลาดในการดึงข้อมูล:", e)
         time.sleep(60)
 
-# --- เริ่มทำงานพร้อมกันทั้ง 2 ระบบ ---
-if __name__ == "__main__":
-    t = threading.Thread(target=bot_loop)
-    t.start()
-    run_web_server()
+# ให้ Thread เริ่มรัน bot_loop ทันทีตอนเปิดไฟล์
+threading.Thread(target=bot_loop, daemon=True).start()
