@@ -1,123 +1,321 @@
+"""
+XAUUSD (Gold) Multi-Timeframe SMC/PA Signal Bot
+------------------------------------------------
+- Data source : yfinance (GC=F)
+- Web server  : Flask (port 8080) สำหรับให้ Render มองเห็นว่า service ยัง alive
+- Bot loop    : รันแยกด้วย threading เพื่อสแกนสัญญาณต่อเนื่อง 24/7
+- Strategy    : Trend filter (EMA200 บน H1) + Fair Value Gap (FVG) บน 5M
+- Money Mgmt  : RR 1:2, SL = ปลาย FVG +/- 1.0 USD
+- Notify      : Telegram Bot API (Markdown)
+
+Environment Variables ที่ต้องตั้งค่าบน Render:
+    TELEGRAM_BOT_TOKEN   -> Token ของบอทจาก BotFather
+    TELEGRAM_CHAT_ID     -> Chat ID ปลายทางที่จะรับการแจ้งเตือน
+    SYMBOL               -> (optional) default = "GC=F"
+    SCAN_INTERVAL_SEC    -> (optional) default = 60 วินาที
+"""
+
 import os
 import time
 import threading
-import requests
-import yfinance as yf
-import pandas as pd
-from flask import Flask
+import logging
+from datetime import datetime, timezone
 
-# --- ระบบ Web Server สำหรับ Render ---
+import requests
+import pandas as pd
+import yfinance as yf
+from flask import Flask, jsonify
+
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
+SYMBOL = os.environ.get("SYMBOL", "GC=F")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", "60"))
+
+EMA_PERIOD = 200
+RISK_REWARD_RATIO = 2.0
+SL_BUFFER_USD = 1.0
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("xauusd-bot")
+
+# เก็บ timestamp ของแท่งเทียนล่าสุดที่เคยยิงสัญญาณไปแล้ว เพื่อกันยิงซ้ำ
+last_signal_state = {
+    "candle_time": None,
+    "direction": None,
+}
+
+# ---------------------------------------------------------------------------
+# FLASK APP (สำหรับ Render Web Service / Health Check)
+# ---------------------------------------------------------------------------
 app = Flask(__name__)
 
-@app.route('/')
+
+@app.route("/")
 def home():
-    return "SMC Pro (5M + H1 Trend + TP/SL) Bot is running 24/7!"
+    return jsonify(
+        {
+            "status": "running",
+            "symbol": SYMBOL,
+            "last_signal_candle": str(last_signal_state["candle_time"]),
+            "last_signal_direction": last_signal_state["direction"],
+            "server_time_utc": datetime.now(timezone.utc).isoformat(),
+        }
+    )
 
-def run_web_server():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
 
-# --- ข้อมูล Telegram Bot ---
-TOKEN = "8977273894:AAEcJ-KSwZF7TZClxGaNauK76rGrzQ1I6D0"
-CHAT_ID = "1484260985"
+@app.route("/health")
+def health():
+    return "OK", 200
 
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
+
+# ---------------------------------------------------------------------------
+# TELEGRAM
+# ---------------------------------------------------------------------------
+def send_telegram_message(text: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("ยังไม่ได้ตั้งค่า TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID จึงข้ามการส่งข้อความ")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }
     try:
-        requests.post(url, json=payload)
-    except Exception as e:
-        print("Error sending message:", e)
+        resp = requests.post(url, data=payload, timeout=15)
+        if resp.status_code != 200:
+            log.error("ส่งข้อความ Telegram ไม่สำเร็จ: %s", resp.text)
+    except Exception as e:  # noqa: BLE001
+        log.error("เกิดข้อผิดพลาดตอนส่ง Telegram: %s", e)
 
-last_signal_time = None
 
-def check_trading_signal():
-    global last_signal_time
+def format_signal_message(
+    direction: str,
+    entry: float,
+    sl: float,
+    tp: float,
+    fvg_top: float,
+    fvg_bottom: float,
+    candle_time,
+) -> str:
+    emoji = "🟢" if direction == "BUY" else "🔴"
+    risk = abs(entry - sl)
+    reward = abs(tp - entry)
 
-    # ดึงข้อมูล Multi-Timeframe (H1 และ 5M)
-    df_h1 = yf.download(tickers="GC=F", period="10d", interval="1h", progress=False)
-    df_5m = yf.download(tickers="GC=F", period="5d", interval="5m", progress=False)
+    msg = (
+        f"{emoji} *SIGNAL {direction}* — `{SYMBOL}` (XAUUSD)\n"
+        f"────────────────────\n"
+        f"🕒 *Timeframe:* 5M (Trend filter H1)\n"
+        f"📌 *Entry:* `{entry:.2f}`\n"
+        f"🛑 *Stop Loss:* `{sl:.2f}`  (Risk ≈ {risk:.2f} USD)\n"
+        f"🎯 *Take Profit:* `{tp:.2f}`  (Reward ≈ {reward:.2f} USD)\n"
+        f"⚖️ *Risk:Reward:* 1:{RISK_REWARD_RATIO:.1f}\n"
+        f"📐 *FVG Zone:* `{fvg_bottom:.2f}` - `{fvg_top:.2f}`\n"
+        f"🕯️ *Candle Time (UTC):* `{candle_time}`\n"
+        f"────────────────────\n"
+        f"_สัญญาณจากระบบ SMC + Price Action (EMA200 H1 + FVG 5M)_"
+    )
+    return msg
 
-    if df_h1.empty or df_5m.empty or len(df_5m) < 205 or len(df_h1) < 200:
-        return
 
-    # จัดการ MultiIndex จาก yfinance
-    if isinstance(df_h1.columns, pd.MultiIndex):
-        df_h1.columns = df_h1.columns.get_level_values(0)
-    if isinstance(df_5m.columns, pd.MultiIndex):
-        df_5m.columns = df_5m.columns.get_level_values(0)
+# ---------------------------------------------------------------------------
+# DATA FETCHING
+# ---------------------------------------------------------------------------
+def fetch_h1_data() -> pd.DataFrame:
+    """ดึงข้อมูล H1 ย้อนหลังพอสำหรับคำนวณ EMA200"""
+    df = yf.download(
+        tickers=SYMBOL,
+        period="60d",
+        interval="1h",
+        progress=False,
+        auto_adjust=False,
+    )
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.dropna()
+    return df
 
-    # คำนวณ EMA200 บน H1 (คุมเทรนภาพใหญ่)
-    df_h1['EMA200'] = df_h1['Close'].ewm(span=200, adjust=False).mean()
-    h1_trend_up = df_h1['Close'].iloc[-1] > df_h1['EMA200'].iloc[-1]
-    h1_trend_down = df_h1['Close'].iloc[-1] < df_h1['EMA200'].iloc[-1]
 
-    # ดึงแท่งเทียน 5M ย้อนหลัง
-    c_prev2 = df_5m.iloc[-3]
-    c_prev1 = df_5m.iloc[-2]
-    c_curr  = df_5m.iloc[-1]
-    
-    curr_time = df_5m.index[-1]
-    if last_signal_time == curr_time:
-        return
+def fetch_5m_data() -> pd.DataFrame:
+    """ดึงข้อมูล 5M สำหรับสแกน FVG (yfinance จำกัดข้อมูล intraday ~60 วันย้อนหลัง)"""
+    df = yf.download(
+        tickers=SYMBOL,
+        period="5d",
+        interval="5m",
+        progress=False,
+        auto_adjust=False,
+    )
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.dropna()
+    return df
 
-    entry_price = c_curr['Close']
 
-    # --- BUY SETUP (H1 Uptrend + 5M Bullish FVG) ---
-    has_bullish_fvg = c_prev2['High'] < c_curr['Low']
-    
-    if h1_trend_up and has_bullish_fvg:
-        fvg_top = c_curr['Low']
-        fvg_bottom = c_prev2['High']
-        
-        # คำนวณ SL (เผื่อใต้ FVG 1.0 เหรียญ) & TP (RR 1:2)
-        sl_price = fvg_bottom - 1.0
-        risk = entry_price - sl_price
-        tp_price = entry_price + (risk * 2)
+# ---------------------------------------------------------------------------
+# STRATEGY LOGIC
+# ---------------------------------------------------------------------------
+def get_h1_trend(df_h1: pd.DataFrame) -> str:
+    """คืนค่า 'UP' / 'DOWN' / 'NONE' จากราคาปิดล่าสุดเทียบ EMA200 บน H1"""
+    if len(df_h1) < EMA_PERIOD:
+        log.warning("ข้อมูล H1 ไม่พอสำหรับคำนวณ EMA%d (มี %d แท่ง)", EMA_PERIOD, len(df_h1))
+        return "NONE"
 
-        msg = (
-            f"🟢 **SIGNAL BUY (XAUUSD)**\n"
-            f"🌐 **Timeframe:** 5M (Conform H1 Uptrend)\n\n"
-            f"📥 **Entry Price:** `{entry_price:.2f}`\n"
-            f"🎯 **Target (TP 1:2):** `{tp_price:.2f}`\n"
-            f"🛡️ **Stop Loss (SL):** `{sl_price:.2f}`\n"
-            f"📌 **FVG Zone:** `{fvg_bottom:.2f} - {fvg_top:.2f}`"
+    df_h1 = df_h1.copy()
+    df_h1["EMA200"] = df_h1["Close"].ewm(span=EMA_PERIOD, adjust=False).mean()
+
+    last_close = float(df_h1["Close"].iloc[-1])
+    last_ema = float(df_h1["EMA200"].iloc[-1])
+
+    if last_close > last_ema:
+        return "UP"
+    elif last_close < last_ema:
+        return "DOWN"
+    return "NONE"
+
+
+def detect_fvg(df_5m: pd.DataFrame, trend: str):
+    """
+    ตรวจสอบ Fair Value Gap บนแท่งล่าสุด 3 แท่ง (prev2, prev1, current)
+
+    Bullish FVG: High(prev2) < Low(current)  -> เกิดในเทรนขาขึ้น
+    Bearish FVG: Low(prev2)  > High(current) -> เกิดในเทรนขาลง
+
+    คืนค่า dict สัญญาณ หรือ None ถ้าไม่มีสัญญาณ
+    """
+    if len(df_5m) < 3:
+        return None
+
+    prev2 = df_5m.iloc[-3]
+    current = df_5m.iloc[-1]
+    candle_time = df_5m.index[-1]
+
+    high_prev2 = float(prev2["High"])
+    low_prev2 = float(prev2["Low"])
+    high_curr = float(current["High"])
+    low_curr = float(current["Low"])
+    close_curr = float(current["Close"])
+
+    # ----- BUY: เทรนขาขึ้น + Bullish FVG -----
+    if trend == "UP" and high_prev2 < low_curr:
+        fvg_bottom = high_prev2   # ปลาย FVG ด้านล่าง
+        fvg_top = low_curr        # ปลาย FVG ด้านบน
+
+        entry = close_curr
+        sl = fvg_bottom - SL_BUFFER_USD
+        risk = entry - sl
+        if risk <= 0:
+            return None
+        tp = entry + (risk * RISK_REWARD_RATIO)
+
+        return {
+            "direction": "BUY",
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
+            "fvg_top": fvg_top,
+            "fvg_bottom": fvg_bottom,
+            "candle_time": candle_time,
+        }
+
+    # ----- SELL: เทรนขาลง + Bearish FVG -----
+    if trend == "DOWN" and low_prev2 > high_curr:
+        fvg_top = low_prev2       # ปลาย FVG ด้านบน
+        fvg_bottom = high_curr    # ปลาย FVG ด้านล่าง
+
+        entry = close_curr
+        sl = fvg_top + SL_BUFFER_USD
+        risk = sl - entry
+        if risk <= 0:
+            return None
+        tp = entry - (risk * RISK_REWARD_RATIO)
+
+        return {
+            "direction": "SELL",
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
+            "fvg_top": fvg_top,
+            "fvg_bottom": fvg_bottom,
+            "candle_time": candle_time,
+        }
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# MAIN SCAN LOOP
+# ---------------------------------------------------------------------------
+def scan_once():
+    try:
+        df_h1 = fetch_h1_data()
+        trend = get_h1_trend(df_h1)
+        log.info("H1 Trend: %s", trend)
+
+        if trend == "NONE":
+            return
+
+        df_5m = fetch_5m_data()
+        signal = detect_fvg(df_5m, trend)
+
+        if signal is None:
+            log.info("ไม่พบสัญญาณในรอบนี้ (Trend=%s)", trend)
+            return
+
+        candle_time = signal["candle_time"]
+
+        # ----- กันยิงสัญญาณซ้ำในแท่งเทียนเดิม -----
+        if (
+            last_signal_state["candle_time"] == candle_time
+            and last_signal_state["direction"] == signal["direction"]
+        ):
+            log.info("สัญญาณ %s ที่แท่ง %s เคยยิงไปแล้ว ข้ามรอบนี้", signal["direction"], candle_time)
+            return
+
+        msg = format_signal_message(
+            direction=signal["direction"],
+            entry=signal["entry"],
+            sl=signal["sl"],
+            tp=signal["tp"],
+            fvg_top=signal["fvg_top"],
+            fvg_bottom=signal["fvg_bottom"],
+            candle_time=candle_time,
         )
-        send_telegram(msg)
-        last_signal_time = curr_time
-        return
+        send_telegram_message(msg)
+        log.info("ส่งสัญญาณ %s สำเร็จ (Entry=%.2f SL=%.2f TP=%.2f)",
+                  signal["direction"], signal["entry"], signal["sl"], signal["tp"])
 
-    # --- SELL SETUP (H1 Downtrend + 5M Bearish FVG) ---
-    has_bearish_fvg = c_prev2['Low'] > c_curr['High']
+        last_signal_state["candle_time"] = candle_time
+        last_signal_state["direction"] = signal["direction"]
 
-    if h1_trend_down and has_bearish_fvg:
-        fvg_top = c_prev2['Low']
-        fvg_bottom = c_curr['High']
-        
-        # คำนวณ SL (เผื่อเหนือ FVG 1.0 เหรียญ) & TP (RR 1:2)
-        sl_price = fvg_top + 1.0
-        risk = sl_price - entry_price
-        tp_price = entry_price - (risk * 2)
+    except Exception as e:  # noqa: BLE001
+        log.exception("เกิดข้อผิดพลาดระหว่างสแกน: %s", e)
 
-        msg = (
-            f"🔴 **SIGNAL SELL (XAUUSD)**\n"
-            f"🌐 **Timeframe:** 5M (Conform H1 Downtrend)\n\n"
-            f"📥 **Entry Price:** `{entry_price:.2f}`\n"
-            f"🎯 **Target (TP 1:2):** `{tp_price:.2f}`\n"
-            f"🛡️ **Stop Loss (SL):** `{sl_price:.2f}`\n"
-            f"📌 **FVG Zone:** `{fvg_bottom:.2f} - {fvg_top:.2f}`"
-        )
-        send_telegram(msg)
-        last_signal_time = curr_time
-        return
 
 def bot_loop():
-    send_telegram("🚀 อัปเดตบอท SMC Pro (TF 5M + H1 Trend + TP/SL 1:2) เรียบร้อยแล้วครับ!")
+    log.info("เริ่มการทำงานของ Bot Loop (scan ทุก %d วินาที)", SCAN_INTERVAL_SEC)
     while True:
-        try:
-            check_trading_signal()
-        except Exception as e:
-            print("เกิดข้อผิดพลาดในการดึงข้อมูล:", e)
-        time.sleep(60)
+        scan_once()
+        time.sleep(SCAN_INTERVAL_SEC)
 
-threading.Thread(target=bot_loop, daemon=True).start()
+
+# ---------------------------------------------------------------------------
+# ENTRYPOINT
+# ---------------------------------------------------------------------------
+def start_background_thread():
+    t = threading.Thread(target=bot_loop, daemon=True)
+    t.start()
+
+
+start_background_thread()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
