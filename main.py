@@ -545,10 +545,9 @@ def bot_loop():
             log.exception("เกิดข้อผิดพลาดใน bot_loop: %s", e)
         time.sleep(SCAN_INTERVAL_SEC)
 
-# --- START THREAD WITH APP CONTEXT ---
-with app.app_context():
-    bot_thread = threading.Thread(target=bot_loop, daemon=True)
-    bot_thread.start()
+# เริ่ม Thread สแกนกราฟเบื้องหลัง
+bot_thread = threading.Thread(target=bot_loop, daemon=True)
+bot_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
