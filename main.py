@@ -530,6 +530,12 @@ def scan_once():
         log.exception("เกิดข้อผิดพลาดระหว่างสแกน: %s", e)
 
 
+# --- HEALTH CHECK ROUTE ---
+@app.route("/")
+def health_check():
+    return {"status": "ok", "bot": "running"}, 200
+
+# --- BOT LOOP FUNCTION ---
 def bot_loop():
     log.info("เริ่มการทำงานของ Bot Loop (scan ทุก %d วินาที)", SCAN_INTERVAL_SEC)
     while True:
@@ -539,14 +545,10 @@ def bot_loop():
             log.exception("เกิดข้อผิดพลาดใน bot_loop: %s", e)
         time.sleep(SCAN_INTERVAL_SEC)
 
-# สั่งรัน Thread บอททันทีที่ Gunicorn / Flask Import โหลดไฟล์นี้
-t = threading.Thread(target=bot_loop, daemon=True)
-t.start()
-
-# เพิ่ม Route หน้าบ้านสำหรับ Health Check ให้ Render / UptimeRobot เช็กได้ตลอดเวลา
-@app.route("/")
-def health_check():
-    return {"status": "ok", "bot": "running"}, 200
+# --- START THREAD WITH APP CONTEXT ---
+with app.app_context():
+    bot_thread = threading.Thread(target=bot_loop, daemon=True)
+    bot_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
