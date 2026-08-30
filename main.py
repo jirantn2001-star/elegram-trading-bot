@@ -1,6 +1,6 @@
 """
-XAUUSD (Gold) Multi-Timeframe SMC/PA Signal Bot
-------------------------------------------------
+XAUUSD (Gold) Multi-Timeframe SMC/PA Signal Bot — v2
+------------------------------------------------------
 - Data source : yfinance (GC=F)
 - Web server  : Flask (port 8080) สำหรับให้ Render มองเห็นว่า service ยัง alive
 - Bot loop    : รันแยกด้วย threading เพื่อสแกนสัญญาณต่อเนื่อง 24/7
@@ -8,18 +8,28 @@ XAUUSD (Gold) Multi-Timeframe SMC/PA Signal Bot
 - Money Mgmt  : RR 1:2, SL = ปลาย FVG +/- 1.0 USD
 - Notify      : Telegram Bot API (Markdown)
 
+--- สิ่งที่เพิ่มใน v2 ---
+1. Active Signal Storage : เก็บสัญญาณที่ยังไม่ปิดไว้ใน active_signals (list of dict)
+2. Price Monitoring      : ทุกรอบ scan จะเช็ค High/Low ของแท่ง 5M ล่าสุด เทียบกับ TP/SL
+                           ของทุกสัญญาณที่ยังค้างอยู่ ว่าโดนชนหรือยัง
+3. Follow-up Alert       : ยิง Telegram แยกเมื่อ TP หรือ SL โดน แล้วลบสัญญาณนั้นออกจากรายการ
+4. Weekly Summary        : สรุปผล Win/Loss ทุกวันศุกร์ 23:50 UTC แล้ว reset ตัวนับ
+5. Memory Management     : ลบสัญญาณที่ค้างเกิน 24 ชม. ทิ้งอัตโนมัติ (ไม่นับเป็น Win/Loss)
+
 Environment Variables ที่ต้องตั้งค่าบน Render:
     TELEGRAM_BOT_TOKEN   -> Token ของบอทจาก BotFather
     TELEGRAM_CHAT_ID     -> Chat ID ปลายทางที่จะรับการแจ้งเตือน
     SYMBOL               -> (optional) default = "GC=F"
     SCAN_INTERVAL_SEC    -> (optional) default = 60 วินาที
+    SIGNAL_TIMEOUT_HOURS -> (optional) default = 24 ชั่วโมง
 """
 
 import os
 import time
 import threading
 import logging
-from datetime import datetime, timezone
+import itertools
+from datetime import datetime, timezone, timedelta
 
 import requests
 import pandas as pd
@@ -33,10 +43,16 @@ SYMBOL = os.environ.get("SYMBOL", "GC=F")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", "60"))
+SIGNAL_TIMEOUT_HOURS = float(os.environ.get("SIGNAL_TIMEOUT_HOURS", "24"))
 
 EMA_PERIOD = 200
 RISK_REWARD_RATIO = 2.0
 SL_BUFFER_USD = 1.0
+
+# วันศุกร์ = weekday() == 4 (จันทร์=0 ... อาทิตย์=6), เวลา UTC
+WEEKLY_SUMMARY_WEEKDAY = 4
+WEEKLY_SUMMARY_HOUR_UTC = 23
+WEEKLY_SUMMARY_MINUTE_UTC = 50
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,11 +60,36 @@ logging.basicConfig(
 )
 log = logging.getLogger("xauusd-bot")
 
-# เก็บ timestamp ของแท่งเทียนล่าสุดที่เคยยิงสัญญาณไปแล้ว เพื่อกันยิงซ้ำ
+# เก็บ timestamp ของแท่งเทียนล่าสุดที่เคยยิงสัญญาณ "เปิด" ไปแล้ว เพื่อกันยิงซ้ำ
 last_signal_state = {
     "candle_time": None,
     "direction": None,
 }
+
+# ---------------------------------------------------------------------------
+# STATE สำหรับระบบ Journal (v2)
+# ---------------------------------------------------------------------------
+# รายการสัญญาณที่ "เปิด" อยู่ ยังไม่ชน TP/SL
+# แต่ละ item: {id, direction, entry, sl, tp, candle_time, opened_at}
+active_signals: list[dict] = []
+
+# ตัวสร้าง id ให้สัญญาณแต่ละอันไม่ซ้ำกัน (ใช้ในการอ้างอิง/debug เท่านั้น)
+_signal_id_counter = itertools.count(1)
+
+# ตัวนับผลประจำสัปดาห์ สำหรับสรุปทุกวันศุกร์
+weekly_stats = {
+    "signals": 0,
+    "wins": 0,
+    "losses": 0,
+    "timeouts": 0,  # สัญญาณที่ถูกล้างทิ้งเพราะค้างนานเกินไป (ไม่นับ win/loss)
+}
+
+# เก็บ (ปี, เลขสัปดาห์ ISO) ของรอบล่าสุดที่เคยส่งสรุปไปแล้ว กันส่งซ้ำในหน้าต่าง 10 นาทีของวันศุกร์
+_last_weekly_summary_sent_isoweek = None
+
+# lock ป้องกัน race condition ระหว่าง thread หลัก (bot_loop) กับ endpoint Flask ที่มาอ่านค่า
+state_lock = threading.Lock()
+
 
 # ---------------------------------------------------------------------------
 # FLASK APP (สำหรับ Render Web Service / Health Check)
@@ -58,15 +99,19 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return jsonify(
-        {
-            "status": "running",
-            "symbol": SYMBOL,
-            "last_signal_candle": str(last_signal_state["candle_time"]),
-            "last_signal_direction": last_signal_state["direction"],
-            "server_time_utc": datetime.now(timezone.utc).isoformat(),
-        }
-    )
+    with state_lock:
+        return jsonify(
+            {
+                "status": "running",
+                "symbol": SYMBOL,
+                "last_signal_candle": str(last_signal_state["candle_time"]),
+                "last_signal_direction": last_signal_state["direction"],
+                "active_signals_count": len(active_signals),
+                "active_signals": active_signals,
+                "weekly_stats": weekly_stats,
+                "server_time_utc": datetime.now(timezone.utc).isoformat(),
+            }
+        )
 
 
 @app.route("/health")
@@ -122,6 +167,57 @@ def format_signal_message(
         f"🕯️ *Candle Time (UTC):* `{candle_time}`\n"
         f"────────────────────\n"
         f"_สัญญาณจากระบบ SMC + Price Action (EMA200 H1 + FVG 5M)_"
+    )
+    return msg
+
+
+def format_result_message(signal: dict, result: str, hit_price: float) -> str:
+    """
+    result: 'TP' หรือ 'SL'
+    สร้างข้อความแจ้งผลลัพธ์แบบเห็นชัดเจน (Win/Loss)
+    """
+    if result == "TP":
+        emoji = "🎯"
+        title = f"WIN: TP Hit (+{RISK_REWARD_RATIO:.0f}R)"
+    else:
+        emoji = "🛑"
+        title = "LOSS: SL Hit (-1R)"
+
+    opened_at = signal["opened_at"]
+    duration = datetime.now(timezone.utc) - opened_at
+    duration_min = int(duration.total_seconds() // 60)
+
+    msg = (
+        f"{emoji} *{title}*\n"
+        f"────────────────────\n"
+        f"📌 *{signal['direction']}* `{SYMBOL}` @ `{signal['entry']:.2f}`\n"
+        f"💰 *ราคาที่ชน:* `{hit_price:.2f}`\n"
+        f"🎯 TP: `{signal['tp']:.2f}`   🛑 SL: `{signal['sl']:.2f}`\n"
+        f"⏱️ *ถือสัญญาณ:* {duration_min} นาที\n"
+        f"🕯️ *เปิดสัญญาณที่แท่ง:* `{signal['candle_time']}`\n"
+        f"────────────────────"
+    )
+    return msg
+
+
+def format_weekly_summary_message() -> str:
+    signals = weekly_stats["signals"]
+    wins = weekly_stats["wins"]
+    losses = weekly_stats["losses"]
+    timeouts = weekly_stats["timeouts"]
+    resolved = wins + losses
+    win_rate = (wins / resolved * 100) if resolved > 0 else 0.0
+
+    msg = (
+        f"📊 *Weekly Performance Summary* — `{SYMBOL}`\n"
+        f"────────────────────\n"
+        f"📨 *สัญญาณทั้งหมด:* {signals}\n"
+        f"✅ *Win:* {wins}\n"
+        f"❌ *Loss:* {losses}\n"
+        f"⌛ *Timeout (ค้างเกิน {SIGNAL_TIMEOUT_HOURS:.0f} ชม.):* {timeouts}\n"
+        f"🏆 *Win Rate:* {win_rate:.0f}%\n"
+        f"────────────────────\n"
+        f"_สรุปสัปดาห์นี้ — ตัวนับจะถูกรีเซ็ตสำหรับสัปดาห์ถัดไป_"
     )
     return msg
 
@@ -251,6 +347,119 @@ def detect_fvg(df_5m: pd.DataFrame, trend: str):
 
 
 # ---------------------------------------------------------------------------
+# (ใหม่ v2) SIGNAL MONITORING — เช็คว่าสัญญาณที่เปิดค้างไว้ชน TP/SL หรือยัง
+# ---------------------------------------------------------------------------
+def monitor_active_signals(df_5m: pd.DataFrame) -> None:
+    """
+    ใช้ High/Low ของแท่ง 5M ล่าสุดมาเช็คกับทุกสัญญาณใน active_signals
+    - BUY : Low <= SL  -> โดน SL (Loss) | High >= TP -> โดน TP (Win)
+    - SELL: High >= SL -> โดน SL (Loss) | Low <= TP  -> โดน TP (Win)
+
+    ถ้าราคาแกว่งชนทั้ง TP และ SL ในแท่งเดียวกัน (กรณี volatility สูง)
+    จะยึด SL เป็นหลักก่อน เพื่อความระมัดระวังสูงสุด (conservative)
+    """
+    if df_5m.empty or not active_signals:
+        return
+
+    latest_candle = df_5m.iloc[-1]
+    high = float(latest_candle["High"])
+    low = float(latest_candle["Low"])
+
+    still_active = []
+
+    with state_lock:
+        for signal in active_signals:
+            direction = signal["direction"]
+            sl = signal["sl"]
+            tp = signal["tp"]
+
+            hit_result = None
+            hit_price = None
+
+            if direction == "BUY":
+                if low <= sl:
+                    hit_result = "SL"
+                    hit_price = sl
+                elif high >= tp:
+                    hit_result = "TP"
+                    hit_price = tp
+            elif direction == "SELL":
+                if high >= sl:
+                    hit_result = "SL"
+                    hit_price = sl
+                elif low <= tp:
+                    hit_result = "TP"
+                    hit_price = tp
+
+            if hit_result is not None:
+                # ----- ยิงข้อความแจ้งผล แล้วอัปเดตสถิติสัปดาห์ -----
+                msg = format_result_message(signal, hit_result, hit_price)
+                send_telegram_message(msg)
+
+                if hit_result == "TP":
+                    weekly_stats["wins"] += 1
+                    log.info("สัญญาณ id=%s (%s) ชน TP", signal["id"], direction)
+                else:
+                    weekly_stats["losses"] += 1
+                    log.info("สัญญาณ id=%s (%s) ชน SL", signal["id"], direction)
+                # ไม่เก็บสัญญาณนี้ต่อ (ลบออกจากลิสต์)
+            else:
+                # ----- (ใหม่ v2) Memory Management: ล้างสัญญาณที่ค้างนานเกินไป -----
+                age = datetime.now(timezone.utc) - signal["opened_at"]
+                if age > timedelta(hours=SIGNAL_TIMEOUT_HOURS):
+                    weekly_stats["timeouts"] += 1
+                    log.info(
+                        "สัญญาณ id=%s (%s) ค้างเกิน %.0f ชม. ลบทิ้งเพื่อกัน memory leak",
+                        signal["id"], direction, SIGNAL_TIMEOUT_HOURS,
+                    )
+                    send_telegram_message(
+                        f"⌛ *TIMEOUT:* สัญญาณ {direction} `{SYMBOL}` @ `{signal['entry']:.2f}` "
+                        f"ค้างเกิน {SIGNAL_TIMEOUT_HOURS:.0f} ชม. ยังไม่ชน TP/SL จึงลบออกจากระบบติดตาม"
+                    )
+                    # ไม่นับ win/loss เพราะยังไม่รู้ผลจริง
+                else:
+                    still_active.append(signal)
+
+        active_signals[:] = still_active
+
+
+# ---------------------------------------------------------------------------
+# (ใหม่ v2) WEEKLY SUMMARY — ส่งสรุปทุกวันศุกร์ 23:50 UTC
+# ---------------------------------------------------------------------------
+def check_and_send_weekly_summary() -> None:
+    global _last_weekly_summary_sent_isoweek
+
+    now = datetime.now(timezone.utc)
+    is_friday = now.weekday() == WEEKLY_SUMMARY_WEEKDAY
+    is_summary_time = (
+        now.hour == WEEKLY_SUMMARY_HOUR_UTC and now.minute >= WEEKLY_SUMMARY_MINUTE_UTC
+    )
+
+    if not (is_friday and is_summary_time):
+        return
+
+    iso_year, iso_week, _ = now.isocalendar()
+    current_key = (iso_year, iso_week)
+
+    # กันส่งซ้ำหลายครั้งในหน้าต่าง 10 นาทีสุดท้ายของวันศุกร์ (loop รันทุก SCAN_INTERVAL_SEC)
+    if _last_weekly_summary_sent_isoweek == current_key:
+        return
+
+    msg = format_weekly_summary_message()
+    send_telegram_message(msg)
+    log.info("ส่งสรุปผลประจำสัปดาห์แล้ว: %s", weekly_stats)
+
+    # ----- Reset ตัวนับสำหรับสัปดาห์ถัดไป -----
+    with state_lock:
+        weekly_stats["signals"] = 0
+        weekly_stats["wins"] = 0
+        weekly_stats["losses"] = 0
+        weekly_stats["timeouts"] = 0
+
+    _last_weekly_summary_sent_isoweek = current_key
+
+
+# ---------------------------------------------------------------------------
 # MAIN SCAN LOOP
 # ---------------------------------------------------------------------------
 def scan_once():
@@ -259,14 +468,21 @@ def scan_once():
         trend = get_h1_trend(df_h1)
         log.info("H1 Trend: %s", trend)
 
+        df_5m = fetch_5m_data()
+
+        # (v2) ทุกรอบต้องเช็คสัญญาณที่ค้างอยู่ก่อน ไม่ว่าจะมีเทรนใหม่หรือไม่
+        monitor_active_signals(df_5m)
+
+        # (v2) เช็คว่าถึงเวลาส่งสรุปประจำสัปดาห์หรือยัง (ทำทุกรอบ ไม่ผูกกับเทรน)
+        check_and_send_weekly_summary()
+
         if trend == "NONE":
             return
 
-        df_5m = fetch_5m_data()
         signal = detect_fvg(df_5m, trend)
 
         if signal is None:
-            log.info("ไม่พบสัญญาณในรอบนี้ (Trend=%s)", trend)
+            log.info("ไม่พบสัญญาณใหม่ในรอบนี้ (Trend=%s)", trend)
             return
 
         candle_time = signal["candle_time"]
@@ -295,6 +511,21 @@ def scan_once():
         last_signal_state["candle_time"] = candle_time
         last_signal_state["direction"] = signal["direction"]
 
+        # ----- (v2) บันทึกสัญญาณนี้ลง active_signals เพื่อติดตามผลต่อ -----
+        with state_lock:
+            active_signals.append(
+                {
+                    "id": next(_signal_id_counter),
+                    "direction": signal["direction"],
+                    "entry": signal["entry"],
+                    "sl": signal["sl"],
+                    "tp": signal["tp"],
+                    "candle_time": str(candle_time),
+                    "opened_at": datetime.now(timezone.utc),
+                }
+            )
+            weekly_stats["signals"] += 1
+
     except Exception as e:  # noqa: BLE001
         log.exception("เกิดข้อผิดพลาดระหว่างสแกน: %s", e)
 
@@ -317,5 +548,5 @@ def start_background_thread():
 start_background_thread()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
