@@ -11,7 +11,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "SMC Pro (24/7 + TP/SL) Bot is running!"
+    return "SMC Pro (5M + H1 Trend + TP/SL) Bot is running 24/7!"
 
 def run_web_server():
     port = int(os.environ.get("PORT", 8080))
@@ -34,49 +34,50 @@ last_signal_time = None
 def check_trading_signal():
     global last_signal_time
 
-    # ดึงข้อมูล Multi-Timeframe (H1 และ 15M)
+    # ดึงข้อมูล Multi-Timeframe (H1 และ 5M)
     df_h1 = yf.download(tickers="GC=F", period="10d", interval="1h", progress=False)
-    df_15m = yf.download(tickers="GC=F", period="5d", interval="15m", progress=False)
+    df_5m = yf.download(tickers="GC=F", period="5d", interval="5m", progress=False)
 
-    if df_h1.empty or df_15m.empty or len(df_15m) < 205 or len(df_h1) < 200:
+    if df_h1.empty or df_5m.empty or len(df_5m) < 205 or len(df_h1) < 200:
         return
 
-    # จัดการ MultiIndex
+    # จัดการ MultiIndex จาก yfinance
     if isinstance(df_h1.columns, pd.MultiIndex):
         df_h1.columns = df_h1.columns.get_level_values(0)
-    if isinstance(df_15m.columns, pd.MultiIndex):
-        df_15m.columns = df_15m.columns.get_level_values(0)
+    if isinstance(df_5m.columns, pd.MultiIndex):
+        df_5m.columns = df_5m.columns.get_level_values(0)
 
-    # คำนวณ EMA200 บน H1 (เทรนภาพใหญ่)
+    # คำนวณ EMA200 บน H1 (คุมเทรนภาพใหญ่)
     df_h1['EMA200'] = df_h1['Close'].ewm(span=200, adjust=False).mean()
     h1_trend_up = df_h1['Close'].iloc[-1] > df_h1['EMA200'].iloc[-1]
     h1_trend_down = df_h1['Close'].iloc[-1] < df_h1['EMA200'].iloc[-1]
 
-    # ดึงแท่งเทียน 15M
-    c_prev2 = df_15m.iloc[-3]
-    c_prev1 = df_15m.iloc[-2]
-    c_curr  = df_15m.iloc[-1]
+    # ดึงแท่งเทียน 5M ย้อนหลัง
+    c_prev2 = df_5m.iloc[-3]
+    c_prev1 = df_5m.iloc[-2]
+    c_curr  = df_5m.iloc[-1]
     
-    curr_time = df_15m.index[-1]
+    curr_time = df_5m.index[-1]
     if last_signal_time == curr_time:
         return
 
     entry_price = c_curr['Close']
 
-    # --- BUY SETUP (H1 Uptrend + 15M FVG) ---
+    # --- BUY SETUP (H1 Uptrend + 5M Bullish FVG) ---
     has_bullish_fvg = c_prev2['High'] < c_curr['Low']
     
     if h1_trend_up and has_bullish_fvg:
         fvg_top = c_curr['Low']
         fvg_bottom = c_prev2['High']
         
-        sl_price = fvg_bottom - 1.5
+        # คำนวณ SL (เผื่อใต้ FVG 1.0 เหรียญ) & TP (RR 1:2)
+        sl_price = fvg_bottom - 1.0
         risk = entry_price - sl_price
         tp_price = entry_price + (risk * 2)
 
         msg = (
             f"🟢 **SIGNAL BUY (XAUUSD)**\n"
-            f"🌐 **Timeframe:** 15M (Conform H1 Uptrend)\n\n"
+            f"🌐 **Timeframe:** 5M (Conform H1 Uptrend)\n\n"
             f"📥 **Entry Price:** `{entry_price:.2f}`\n"
             f"🎯 **Target (TP 1:2):** `{tp_price:.2f}`\n"
             f"🛡️ **Stop Loss (SL):** `{sl_price:.2f}`\n"
@@ -86,20 +87,21 @@ def check_trading_signal():
         last_signal_time = curr_time
         return
 
-    # --- SELL SETUP (H1 Downtrend + 15M FVG) ---
+    # --- SELL SETUP (H1 Downtrend + 5M Bearish FVG) ---
     has_bearish_fvg = c_prev2['Low'] > c_curr['High']
 
     if h1_trend_down and has_bearish_fvg:
         fvg_top = c_prev2['Low']
         fvg_bottom = c_curr['High']
         
-        sl_price = fvg_top + 1.5
+        # คำนวณ SL (เผื่อเหนือ FVG 1.0 เหรียญ) & TP (RR 1:2)
+        sl_price = fvg_top + 1.0
         risk = sl_price - entry_price
         tp_price = entry_price - (risk * 2)
 
         msg = (
             f"🔴 **SIGNAL SELL (XAUUSD)**\n"
-            f"🌐 **Timeframe:** 15M (Conform H1 Downtrend)\n\n"
+            f"🌐 **Timeframe:** 5M (Conform H1 Downtrend)\n\n"
             f"📥 **Entry Price:** `{entry_price:.2f}`\n"
             f"🎯 **Target (TP 1:2):** `{tp_price:.2f}`\n"
             f"🛡️ **Stop Loss (SL):** `{sl_price:.2f}`\n"
@@ -110,7 +112,7 @@ def check_trading_signal():
         return
 
 def bot_loop():
-    send_telegram("🚀 อัปเดตบอท SMC Pro (รัน 24 ชม. + H1 Trend + TP/SL 1:2) เรียบร้อยครับ!")
+    send_telegram("🚀 อัปเดตบอท SMC Pro (TF 5M + H1 Trend + TP/SL 1:2) เรียบร้อยแล้วครับ!")
     while True:
         try:
             check_trading_signal()
