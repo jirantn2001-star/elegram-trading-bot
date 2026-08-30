@@ -1,8 +1,23 @@
+import os
 import time
+import threading
 import requests
 import yfinance as yf
 import pandas as pd
+from flask import Flask
 
+# --- ระบบ Web Server เล็กๆ สำหรับแผนฟรีของ Render ---
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running 24/7!"
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+# --- ข้อมูล Telegram Bot ของคุณ ---
 TOKEN = "8977273894:AAEcJ-KSwZF7TZClxGaNauK76rGrzQ1I6D0"
 CHAT_ID = "1484260985"
 
@@ -14,8 +29,7 @@ def send_telegram(message):
     except Exception as e:
         print("Error sending message:", e)
 
-send_telegram("🚀 บอท Cloud เริ่มทำงานแล้ว! กำลังเฝ้ากราฟให้อยู่ครับ")
-
+# --- ฟังก์ชั่นเช็คกราฟทองคำ ---
 def check_trading_signal():
     df = yf.download(tickers="GC=F", period="5d", interval="15m")
     if df.empty:
@@ -38,9 +52,17 @@ def check_trading_signal():
         msg = f"🔴 สัญญาณ SELL (ทองคำ XAUUSD)\nราคาปัจจุบัน: {curr_price:.2f}\nเงื่อนไข: EMA 9 ตัดลงใต้ EMA 21 เรียบร้อย!"
         send_telegram(msg)
 
-while True:
-    try:
-        check_trading_signal()
-    except Exception as e:
-        print("เกิดข้อผิดพลาดในการดึงข้อมูล:", e)
-    time.sleep(60)
+def bot_loop():
+    send_telegram("🚀 บอท Cloud (ฟรี 100%) เริ่มทำงานแล้ว! กำลังเฝ้ากราฟให้อยู่ครับ")
+    while True:
+        try:
+            check_trading_signal()
+        except Exception as e:
+            print("เกิดข้อผิดพลาดในการดึงข้อมูล:", e)
+        time.sleep(60)
+
+# --- เริ่มทำงานพร้อมกันทั้ง 2 ระบบ ---
+if __name__ == "__main__":
+    t = threading.Thread(target=bot_loop)
+    t.start()
+    run_web_server()
